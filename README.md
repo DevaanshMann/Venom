@@ -1,3 +1,5 @@
+The Venom Snake Game was developed as a part of my COMP 469 (Introduction to Artificial Intelligence class at California State University, Northridge), in association with my teammates Abigail Rosas, Vanessa Juarez.<br>
+
 The Venom Snake Game is a Python-based implementation of the classic snake game enhanced with artificial intelligence using Deep Q-Learning.<br>
 The game uses the `pygame` library for rendering the game graphics and managing user input, while `PyTorch` is used to implement the neural network and training logic for the AI.
 
