@@ -27,7 +27,7 @@ frameSpeed = pygame.time.Clock()
 
 # Snake Initial Size & Location
 snakePos = [150, 100]
-snakeSpeed = 25
+snakeSpeed = 17
 snakeSize = [[150, 100], [140, 100]]
 direction = "RIGHT"
 score = 0
@@ -83,7 +83,8 @@ class QTrainer:
 
         pred = self.model(state)
 
-        target = pred.clone()
+        # FIX: detach target from computation graph to prevent incorrect gradients
+        target = pred.clone().detach()
         for idx in range(len(done)):
             Q_new = reward[idx]
             if not done[idx]:
@@ -92,7 +93,7 @@ class QTrainer:
             target[idx][action[idx].item()] = Q_new
 
         self.optimizer.zero_grad()
-        loss = self.criterion(target, pred)
+        loss = self.criterion(pred, target)  # FIX: (prediction, target) is the correct order
         loss.backward()
         self.optimizer.step()
 
@@ -110,16 +111,16 @@ def scoreCount():
 
 # Ends Game + Displays Final Score
 def gameOver():
-    global score_list, game_count, score
+    global score_list, game_count, score, epsilon
 
-    # Track the score
     score_list.append(score)
-
-    # Reset score and increment game count
     game_count += 1
     score = 0
 
-    # Reset game state
+    # FIX: decay epsilon per episode, not per step, so the model has time to learn
+    if epsilon > epsilon_min:
+        epsilon *= decay
+
     reset_game()
 
 def reset_game():
@@ -131,19 +132,37 @@ def reset_game():
     foodPosY = random.randrange(1, int(winHeight / 10)) * 10
     foodPresent = True
 
+def is_dangerous(x, y):
+    if x < 0 or x >= winWidth or y < 0 or y >= winHeight:
+        return True
+    for seg in snakeSize[1:]:
+        if seg[0] == x and seg[1] == y:
+            return True
+    return False
+
 def get_state():
     head_x, head_y = snakePos
     food_x, food_y = foodPosX, foodPosY
+
+    # FIX: danger signals so the agent knows which moves lead to death
+    danger_up    = is_dangerous(head_x, head_y - 10)
+    danger_down  = is_dangerous(head_x, head_y + 10)
+    danger_left  = is_dangerous(head_x - 10, head_y)
+    danger_right = is_dangerous(head_x + 10, head_y)
+
     state = [
-        head_x, head_y,       
-        food_x, food_y,        
-        direction == "UP",  
+        # FIX: normalized relative direction to food (not raw coords)
+        (food_x - head_x) / winWidth,
+        (food_y - head_y) / winHeight,
+        direction == "UP",
         direction == "DOWN",
         direction == "LEFT",
         direction == "RIGHT",
-        head_x - food_x,    
-        head_y - food_y,
-        len(snakeSize)          
+        danger_up,
+        danger_down,
+        danger_left,
+        danger_right,
+        len(snakeSize) / 100,   # normalized snake length
     ]
     return np.array(state, dtype=np.float32)
 
@@ -154,7 +173,7 @@ output_size = 4
 learning_rate = 0.002
 gamma = 0.9
 epsilon = 1.0
-decay = 0.995
+decay = 0.99   # FIX: per-episode decay (was per-step 0.995, now gives ~460 episodes of exploration)
 epsilon_min = 0.01
 batch_size = 64
 
@@ -177,6 +196,11 @@ while running:
         action_values = model(state_tensor)
         action = torch.argmax(action_values).item()
 
+    # FIX: prevent 180-degree U-turns (would instantly kill the snake)
+    opposite = {"UP": 1, "DOWN": 0, "LEFT": 3, "RIGHT": 2}
+    if action == opposite[direction]:
+        action = {"UP": 0, "DOWN": 1, "LEFT": 2, "RIGHT": 3}[direction]
+
     if action == 0:
         direction = "UP"
     elif action == 1:
@@ -185,6 +209,9 @@ while running:
         direction = "LEFT"
     elif action == 3:
         direction = "RIGHT"
+
+    # FIX: capture distance before moving so we can compute a shaping reward
+    prev_dist = abs(snakePos[0] - foodPosX) + abs(snakePos[1] - foodPosY)
 
     # Changing Position based on Direction
     if direction == "UP":
@@ -204,14 +231,15 @@ while running:
         foodPresent = False
     else:
         snakeSize.pop()
-        reward = -0.1 
+        # FIX: shaping reward — reward for moving closer, penalise moving away
+        new_dist = abs(snakePos[0] - foodPosX) + abs(snakePos[1] - foodPosY)
+        reward = 1 if new_dist < prev_dist else -1
 
     if not foodPresent:
         foodPosX = random.randrange(1, int(winWidth / 10)) * 10
         foodPosY = random.randrange(1, int(winHeight / 10)) * 10
     foodPresent = True
 
-    # Generates New Food in Random Location
     done = False
     if snakePos[0] < 0 or snakePos[0] > winWidth - 10:
         reward = -10
@@ -226,8 +254,20 @@ while running:
             reward = -10
             done = True
 
+    # FIX: store transition BEFORE the done/continue so terminal experiences are learned from
+    nextState = get_state()
+    memory.append((state, action, reward, nextState, done))
+
+    if len(memory) > batch_size:
+        mini_batch = random.sample(memory, batch_size)
+        states, actions, rewards, next_states, dones = zip(*mini_batch)
+        trainer.train_step(states, actions, rewards, next_states, dones)
+
     if done:
         gameOver()
+        # FIX: update target network per episode, not every step
+        if game_count % target_update_freq == 0:
+            targetModel.load_state_dict(model.state_dict())
         continue
 
     # Setting Color & Position for Food & Snake
@@ -240,24 +280,6 @@ while running:
     scoreCount()
     pygame.display.update()
     frameSpeed.tick(snakeSpeed)
-
-    # Updating Memory
-    nextState = get_state()
-    memory.append((state, action, reward, nextState, done))
-
-    
-    if len(memory) > batch_size:
-        mini_batch = random.sample(memory, batch_size)
-        states, actions, rewards, next_states, dones = zip(*mini_batch)
-        trainer.train_step(states, actions, rewards, next_states, dones)
-
-    # Update Target Model
-    if game_count % target_update_freq == 0:
-        targetModel.load_state_dict(model.state_dict())
-
-    # Update Epsilon
-    if epsilon > epsilon_min:
-        epsilon *= decay
 
     for event in pygame.event.get():
         if event.type == pygame.QUIT:
